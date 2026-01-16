@@ -579,6 +579,14 @@ class RenfeGeoJSONImporter:
                     if gtfs_stop:
                         # Only assign stops from the same nucleo as the route
                         if gtfs_stop.nucleo_id == gtfs_route.nucleo_id:
+
+                            # Verify that the stop actually has this line
+                            if gtfs_stop.lineas:
+                                stop_lineas_list = [x.strip() for x in gtfs_stop.lineas.split(',') if x.strip()]
+                                if codigo not in stop_lineas_list:
+                                    logger.debug(f"Skipping {gtfs_stop.name}: has lineas={gtfs_stop.lineas}, looking for {codigo}")
+                                    continue
+
                             # Deduplicate: keep only first occurrence for each stop/route pair
                             key = (gtfs_stop.id, gtfs_route.id)
                             if key not in sequences_to_add:
