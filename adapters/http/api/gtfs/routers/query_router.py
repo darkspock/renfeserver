@@ -9,7 +9,7 @@ from sqlalchemy import and_, or_, func
 MADRID_TZ = ZoneInfo("Europe/Madrid")
 
 from core.database import get_db
-from src.gtfs_bc.route.infrastructure.models import RouteModel
+from src.gtfs_bc.route.infrastructure.models import RouteModel, RouteFrequencyModel
 from src.gtfs_bc.stop.infrastructure.models import StopModel
 from src.gtfs_bc.trip.infrastructure.models import TripModel
 from src.gtfs_bc.stop_time.infrastructure.models import StopTimeModel
@@ -22,6 +22,7 @@ from src.gtfs_bc.province.province_lookup import (
     get_province_and_nucleo_by_coordinates,
 )
 from src.gtfs_bc.realtime.infrastructure.services.estimated_positions import EstimatedPositionsService
+from src.gtfs_bc.stop_route_sequence.infrastructure.models import StopRouteSequenceModel
 
 
 router = APIRouter(prefix="/gtfs", tags=["GTFS Query"])
@@ -95,6 +96,9 @@ class DepartureResponse(BaseModel):
     is_delayed: bool = False
     # Train position (from GTFS-RT or estimated)
     train_position: Optional[TrainPositionSchema] = None
+    # Frequency-based estimation (for Metro/ML without GTFS-RT)
+    frequency_based: bool = False  # True if departure is estimated from frequency data
+    headway_secs: Optional[int] = None  # Frequency headway in seconds (e.g., 300 = every 5 min)
 
 
 class TripStopResponse(BaseModel):
@@ -477,6 +481,186 @@ def get_stop(stop_id: str, db: Session = Depends(get_db)):
     return stop
 
 
+def _get_frequency_based_departures(
+    db: Session,
+    stop: StopModel,
+    route_id: Optional[str],
+    limit: int,
+    now: datetime,
+    current_seconds: int,
+) -> List[DepartureResponse]:
+    """Generate frequency-based departure estimates for Metro/ML stops.
+
+    Since Metro doesn't have GTFS-RT or stop_times data, we use frequency data
+    to estimate upcoming departures based on headway intervals.
+    """
+    departures = []
+
+    # Determine day type
+    weekday = now.weekday()
+    if weekday < 5:
+        day_type = "weekday"
+    elif weekday == 5:
+        day_type = "saturday"
+    else:
+        day_type = "sunday"
+
+    current_time = now.time()
+
+    # Get routes serving this stop from stop_route_sequence
+    routes_query = (
+        db.query(RouteModel)
+        .join(StopRouteSequenceModel, RouteModel.id == StopRouteSequenceModel.route_id)
+        .filter(StopRouteSequenceModel.stop_id == stop.id)
+    )
+
+    if route_id:
+        routes_query = routes_query.filter(RouteModel.id == route_id)
+
+    routes = routes_query.all()
+
+    # If no routes found via sequences, try lineas field
+    if not routes and stop.lineas:
+        line_names = [l.strip() for l in stop.lineas.split(",")]
+        for line_name in line_names:
+            # Try to find route by short_name
+            route = db.query(RouteModel).filter(
+                RouteModel.short_name == line_name,
+                RouteModel.id.like("METRO_%") | RouteModel.id.like("ML_%")
+            ).first()
+            if route:
+                if not route_id or route.id == route_id:
+                    routes.append(route)
+
+    if not routes:
+        return []
+
+    # For each route, get current frequency and generate departures
+    for route in routes:
+        # Get applicable frequency for current time and day
+        # Handle end_time=00:00:00 as "until midnight" (end of service)
+        frequency = (
+            db.query(RouteFrequencyModel)
+            .filter(
+                RouteFrequencyModel.route_id == route.id,
+                RouteFrequencyModel.day_type == day_type,
+                RouteFrequencyModel.start_time <= current_time,
+                or_(
+                    RouteFrequencyModel.end_time > current_time,
+                    RouteFrequencyModel.end_time == time(0, 0, 0),  # 00:00:00 means until midnight
+                ),
+            )
+            .first()
+        )
+
+        if not frequency:
+            # Try to get next upcoming frequency
+            frequency = (
+                db.query(RouteFrequencyModel)
+                .filter(
+                    RouteFrequencyModel.route_id == route.id,
+                    RouteFrequencyModel.day_type == day_type,
+                    RouteFrequencyModel.start_time > current_time,
+                )
+                .order_by(RouteFrequencyModel.start_time)
+                .first()
+            )
+
+        if not frequency:
+            continue
+
+        headway_secs = frequency.headway_secs
+
+        # Get stop sequence to determine headsign (direction)
+        stop_seq = (
+            db.query(StopRouteSequenceModel)
+            .filter(
+                StopRouteSequenceModel.route_id == route.id,
+                StopRouteSequenceModel.stop_id == stop.id,
+            )
+            .first()
+        )
+
+        # Get terminal stations for headsign
+        first_stop_seq = (
+            db.query(StopRouteSequenceModel)
+            .filter(StopRouteSequenceModel.route_id == route.id)
+            .order_by(StopRouteSequenceModel.sequence)
+            .first()
+        )
+        last_stop_seq = (
+            db.query(StopRouteSequenceModel)
+            .filter(StopRouteSequenceModel.route_id == route.id)
+            .order_by(StopRouteSequenceModel.sequence.desc())
+            .first()
+        )
+
+        # Generate departures for both directions
+        directions = []
+        if first_stop_seq and last_stop_seq:
+            first_stop = db.query(StopModel).filter(StopModel.id == first_stop_seq.stop_id).first()
+            last_stop = db.query(StopModel).filter(StopModel.id == last_stop_seq.stop_id).first()
+
+            # Don't show direction towards current stop if at terminal
+            if stop_seq:
+                if stop_seq.sequence != first_stop_seq.sequence and last_stop:
+                    directions.append((0, last_stop.name))
+                if stop_seq.sequence != last_stop_seq.sequence and first_stop:
+                    directions.append((1, first_stop.name))
+            else:
+                # If no sequence info, show both directions
+                if last_stop:
+                    directions.append((0, last_stop.name))
+                if first_stop:
+                    directions.append((1, first_stop.name))
+
+        if not directions:
+            directions = [(0, route.long_name or route.short_name)]
+
+        # Generate estimated departures starting from now
+        # Round up to next minute
+        next_departure_seconds = ((current_seconds // 60) + 1) * 60
+
+        # Generate departures for each direction
+        departures_per_direction = max(1, limit // len(directions) // len(routes))
+
+        for direction_id, headsign in directions:
+            # Offset departures for opposite directions by half headway
+            offset = (headway_secs // 2) * direction_id
+            departure_seconds = next_departure_seconds + offset
+
+            for i in range(departures_per_direction):
+                # Calculate departure time string
+                dep_hours = (departure_seconds // 3600) % 24
+                dep_minutes = (departure_seconds % 3600) // 60
+                dep_secs = departure_seconds % 60
+                departure_time_str = f"{dep_hours:02d}:{dep_minutes:02d}:{dep_secs:02d}"
+
+                minutes_until = max(0, (departure_seconds - current_seconds) // 60)
+
+                departures.append(
+                    DepartureResponse(
+                        trip_id=f"{route.id}_FREQ_{direction_id}_{i}",
+                        route_id=route.id,
+                        route_short_name=route.short_name.strip() if route.short_name else "",
+                        route_color=route.color,
+                        headsign=headsign,
+                        departure_time=departure_time_str,
+                        departure_seconds=departure_seconds,
+                        minutes_until=minutes_until,
+                        stop_sequence=stop_seq.sequence if stop_seq else 0,
+                        frequency_based=True,
+                        headway_secs=headway_secs,
+                    )
+                )
+
+                departure_seconds += headway_secs
+
+    # Sort by minutes_until and limit results
+    departures.sort(key=lambda d: d.minutes_until)
+    return departures[:limit]
+
+
 @router.get("/stops/{stop_id}/departures", response_model=List[DepartureResponse])
 def get_stop_departures(
     stop_id: str,
@@ -575,6 +759,40 @@ def get_stop_departures(
         .limit(limit)
         .all()
     )
+
+    # If no stop_times results, check if this is a Metro/ML stop and use frequency-based departures
+    is_metro_stop = stop_id.startswith("METRO_") or stop_id.startswith("ML_")
+    if not results and is_metro_stop:
+        return _get_frequency_based_departures(db, stop, route_id, limit, now, current_seconds)
+
+    # For Metro stops that have SOME stop_times results but may have additional lines
+    # without stop_times (e.g., Line 12), also get frequency-based departures for those lines
+    frequency_departures = []
+    if is_metro_stop and results:
+        # Get routes that have stop_times results
+        routes_with_stop_times = set(route.id for _, _, route in results)
+
+        # Get all routes serving this stop
+        all_route_ids_at_stop = set(
+            seq.route_id for seq in db.query(StopRouteSequenceModel.route_id)
+            .filter(StopRouteSequenceModel.stop_id == stop_id)
+            .all()
+        )
+
+        # Routes that need frequency-based departures
+        routes_needing_freq = all_route_ids_at_stop - routes_with_stop_times
+
+        # Filter by route_id if specified
+        if route_id and route_id not in routes_needing_freq:
+            routes_needing_freq = set()
+
+        if routes_needing_freq:
+            # Get frequency departures for routes without stop_times
+            for freq_route_id in routes_needing_freq:
+                freq_deps = _get_frequency_based_departures(
+                    db, stop, freq_route_id, limit, now, current_seconds
+                )
+                frequency_departures.extend(freq_deps)
 
     # Get trip IDs for realtime delay lookup
     trip_ids = [trip.id for _, trip, _ in results]
@@ -745,10 +963,14 @@ def get_stop_departures(
             )
         )
 
+    # Add frequency-based departures for Metro routes without stop_times
+    if frequency_departures:
+        departures.extend(frequency_departures)
+
     # Sort by realtime departure (use realtime_minutes_until if available, else minutes_until)
     departures.sort(key=lambda d: d.realtime_minutes_until if d.realtime_minutes_until is not None else d.minutes_until)
 
-    return departures
+    return departures[:limit]
 
 
 @router.get("/trips/{trip_id}", response_model=TripDetailResponse)
