@@ -1,4 +1,5 @@
 """Network metadata API endpoints."""
+import re
 from typing import List, Optional
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
@@ -10,6 +11,18 @@ from src.gtfs_bc.route.infrastructure.models import RouteModel
 
 
 router = APIRouter(prefix="/gtfs/networks", tags=["networks"])
+
+
+def natural_sort_key(line_code: str) -> tuple:
+    """
+    Natural sort key for line codes like C1, C2, C10, C4a, C4b.
+    Returns tuple for proper sorting: ('C', 1, '') for C1, ('C', 4, 'a') for C4a.
+    """
+    match = re.match(r'([A-Za-z]+)(\d+)([a-z]*)', line_code)
+    if match:
+        prefix, number, suffix = match.groups()
+        return (prefix, int(number), suffix)
+    return (line_code, 0, '')
 
 
 class NetworkResponse(BaseModel):
@@ -113,17 +126,20 @@ async def get_network(code: str, db: Session = Depends(get_db)):
             }
         )
 
-    # Convert to list
-    lines = [
-        LineResponse(
-            line_code=data["line_code"],
-            color=data["color"],
-            text_color=data["text_color"],
-            route_count=len(data["routes"]),
-            routes=data["routes"],
-        )
-        for data in lines_dict.values()
-    ]
+    # Convert to list with natural sort
+    lines = sorted(
+        [
+            LineResponse(
+                line_code=data["line_code"],
+                color=data["color"],
+                text_color=data["text_color"],
+                route_count=len(data["routes"]),
+                routes=data["routes"],
+            )
+            for data in lines_dict.values()
+        ],
+        key=lambda x: natural_sort_key(x.line_code)
+    )
 
     return NetworkDetailResponse(
         code=network.code,
@@ -175,13 +191,16 @@ async def get_network_lines(code: str, db: Session = Depends(get_db)):
             }
         )
 
-    return [
-        LineResponse(
-            line_code=data["line_code"],
-            color=data["color"],
-            text_color=data["text_color"],
-            route_count=len(data["routes"]),
-            routes=data["routes"],
-        )
-        for data in lines_dict.values()
-    ]
+    return sorted(
+        [
+            LineResponse(
+                line_code=data["line_code"],
+                color=data["color"],
+                text_color=data["text_color"],
+                route_count=len(data["routes"]),
+                routes=data["routes"],
+            )
+            for data in lines_dict.values()
+        ],
+        key=lambda x: natural_sort_key(x.line_code)
+    )
