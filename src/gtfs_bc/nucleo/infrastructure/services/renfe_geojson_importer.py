@@ -87,6 +87,9 @@ class RenfeGeoJSONImporter:
             stats['sequences_created'] = sequences_created
             logger.info(f"Stop sequences: {sequences_created} created")
 
+            # Flush to persist sequences before updating long_name
+            self.db.flush()
+
             # Update route long_name with terminus information
             logger.info("Updating route terminus names...")
             routes_terminus_updated = self._update_route_long_names()
