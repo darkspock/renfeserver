@@ -2,6 +2,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from core.config import settings
+from src.gtfs_bc.realtime.infrastructure.services.gtfs_rt_scheduler import lifespan_with_scheduler
 
 
 def create_app() -> FastAPI:
@@ -11,7 +12,8 @@ def create_app() -> FastAPI:
         description="API de información de transporte ferroviario en España",
         version="1.0.0",
         docs_url="/docs",
-        redoc_url="/redoc"
+        redoc_url="/redoc",
+        lifespan=lifespan_with_scheduler,
     )
 
     # CORS middleware

@@ -1,9 +1,12 @@
 from typing import List, Optional
 from datetime import datetime, date, time, timedelta
+from zoneinfo import ZoneInfo
 from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
 from sqlalchemy import and_, or_, func
+
+MADRID_TZ = ZoneInfo("Europe/Madrid")
 
 from core.database import get_db
 from src.gtfs_bc.route.infrastructure.models import RouteModel
@@ -13,10 +16,12 @@ from src.gtfs_bc.stop_time.infrastructure.models import StopTimeModel
 from src.gtfs_bc.calendar.infrastructure.models import CalendarModel, CalendarDateModel
 from src.gtfs_bc.agency.infrastructure.models import AgencyModel
 from src.gtfs_bc.nucleo.infrastructure.models import NucleoModel
+from src.gtfs_bc.realtime.infrastructure.models import TripUpdateModel, StopTimeUpdateModel, VehiclePositionModel, PlatformHistoryModel
 from src.gtfs_bc.province.province_lookup import (
     get_province_by_coordinates,
     get_province_and_nucleo_by_coordinates,
 )
+from src.gtfs_bc.realtime.infrastructure.services.estimated_positions import EstimatedPositionsService
 
 
 router = APIRouter(prefix="/gtfs", tags=["GTFS Query"])
@@ -60,6 +65,16 @@ class StopResponse(BaseModel):
         from_attributes = True
 
 
+class TrainPositionSchema(BaseModel):
+    """Current position of the train."""
+    latitude: float
+    longitude: float
+    current_stop_name: str
+    status: str  # STOPPED_AT, IN_TRANSIT_TO, INCOMING_AT
+    progress_percent: float
+    estimated: bool = True  # True if calculated from schedule, False if from GTFS-RT
+
+
 class DepartureResponse(BaseModel):
     trip_id: str
     route_id: str
@@ -70,6 +85,16 @@ class DepartureResponse(BaseModel):
     departure_seconds: int
     minutes_until: int
     stop_sequence: int
+    # Platform/track info (from GTFS-RT when available, or estimated from history)
+    platform: Optional[str] = None
+    platform_estimated: bool = False  # True if platform is estimated from history
+    # Realtime delay fields
+    delay_seconds: Optional[int] = None
+    realtime_departure_time: Optional[str] = None
+    realtime_minutes_until: Optional[int] = None
+    is_delayed: bool = False
+    # Train position (from GTFS-RT or estimated)
+    train_position: Optional[TrainPositionSchema] = None
 
 
 class TripStopResponse(BaseModel):
@@ -468,8 +493,8 @@ def get_stop_departures(
     if not stop:
         raise HTTPException(status_code=404, detail=f"Stop {stop_id} not found")
 
-    # Get current time in seconds since midnight
-    now = datetime.now()
+    # Get current time in seconds since midnight (Madrid timezone)
+    now = datetime.now(MADRID_TZ)
     current_seconds = now.hour * 3600 + now.minute * 60 + now.second
     today = now.date()
     weekday = today.weekday()  # 0=Monday, 6=Sunday
@@ -514,14 +539,30 @@ def get_stop_departures(
         return []
 
     # Query stop times with upcoming departures
+    # Subquery to get the max stop_sequence for each trip (to filter out last stops)
+    max_sequence_subquery = (
+        db.query(
+            StopTimeModel.trip_id,
+            func.max(StopTimeModel.stop_sequence).label("max_seq")
+        )
+        .group_by(StopTimeModel.trip_id)
+        .subquery()
+    )
+
     query = (
         db.query(StopTimeModel, TripModel, RouteModel)
         .join(TripModel, StopTimeModel.trip_id == TripModel.id)
         .join(RouteModel, TripModel.route_id == RouteModel.id)
+        .join(
+            max_sequence_subquery,
+            StopTimeModel.trip_id == max_sequence_subquery.c.trip_id
+        )
         .filter(
             StopTimeModel.stop_id == stop_id,
             StopTimeModel.departure_seconds >= current_seconds,
             TripModel.service_id.in_(active_service_ids),
+            # Exclude trips where this stop is the last stop (train arrives, doesn't depart)
+            StopTimeModel.stop_sequence < max_sequence_subquery.c.max_seq,
         )
     )
 
@@ -535,9 +576,154 @@ def get_stop_departures(
         .all()
     )
 
+    # Get trip IDs for realtime delay lookup
+    trip_ids = [trip.id for _, trip, _ in results]
+
+    # Get trip-level delays
+    trip_delays = {}
+    if trip_ids:
+        trip_updates = db.query(TripUpdateModel).filter(
+            TripUpdateModel.trip_id.in_(trip_ids)
+        ).all()
+        trip_delays = {tu.trip_id: tu.delay for tu in trip_updates}
+
+    # Get stop-specific delays and platform info
+    stop_delays = {}
+    stop_platforms = {}
+    if trip_ids:
+        stop_time_updates = db.query(StopTimeUpdateModel).filter(
+            StopTimeUpdateModel.trip_id.in_(trip_ids),
+            StopTimeUpdateModel.stop_id == stop_id,
+        ).all()
+        for stu in stop_time_updates:
+            stop_delays[stu.trip_id] = stu.departure_delay
+            if stu.platform:
+                stop_platforms[stu.trip_id] = stu.platform
+
+    # Get train positions: first try GTFS-RT, then fall back to estimated
+    train_positions = {}
+
+    # 1. Try GTFS-RT vehicle positions
+    vehicle_platforms = {}
+    # Extract numeric stop_id for comparison (e.g., "17000" from "RENFE_17000")
+    queried_stop_numeric = stop_id.replace("RENFE_", "") if stop_id.startswith("RENFE_") else stop_id
+
+    if trip_ids:
+        vehicle_positions = db.query(VehiclePositionModel).filter(
+            VehiclePositionModel.trip_id.in_(trip_ids)
+        ).all()
+        for vp in vehicle_positions:
+            # Get current stop name from stop_id (try with RENFE_ prefix)
+            current_stop = None
+            if vp.stop_id:
+                current_stop = db.query(StopModel).filter(StopModel.id == f"RENFE_{vp.stop_id}").first()
+                if not current_stop:
+                    current_stop = db.query(StopModel).filter(StopModel.id == vp.stop_id).first()
+
+            status = vp.current_status.value if vp.current_status else "IN_TRANSIT_TO"
+            train_positions[vp.trip_id] = TrainPositionSchema(
+                latitude=vp.latitude,
+                longitude=vp.longitude,
+                current_stop_name=current_stop.name if current_stop else "En tránsito",
+                status=status,
+                progress_percent=50.0,  # GTFS-RT doesn't provide progress
+                estimated=False  # This is real GTFS-RT data
+            )
+
+            # Only store platform if train is AT or INCOMING to the queried stop
+            # Compare stop_ids (handle both "17000" and "RENFE_17000" formats)
+            vp_stop_numeric = vp.stop_id.replace("RENFE_", "") if vp.stop_id and vp.stop_id.startswith("RENFE_") else vp.stop_id
+            train_at_queried_stop = vp_stop_numeric == queried_stop_numeric
+
+            if vp.platform and train_at_queried_stop and status in ("STOPPED_AT", "INCOMING_AT"):
+                vehicle_platforms[vp.trip_id] = vp.platform
+
+    # 2. For trips without GTFS-RT, get estimated positions
+    trips_without_position = [tid for tid in trip_ids if tid not in train_positions]
+    if trips_without_position:
+        estimated_service = EstimatedPositionsService(db)
+        # Get estimated positions for the specific trips we need
+        estimated_positions = estimated_service.get_estimated_positions(
+            trip_ids=trips_without_position,
+            limit=len(trips_without_position)
+        )
+        for ep in estimated_positions:
+            train_positions[ep.trip_id] = TrainPositionSchema(
+                latitude=ep.latitude,
+                longitude=ep.longitude,
+                current_stop_name=ep.current_stop_name,
+                status=ep.current_status.value,
+                progress_percent=ep.progress_percent,
+                estimated=True
+            )
+
+    # Helper function to get estimated platform from history
+    def get_estimated_platform(route_short: str, headsign: str) -> Optional[str]:
+        """Get most likely platform from historical data.
+
+        Looks at today's data first, then yesterday's if no data for today.
+        Uses the platform with highest count (most commonly used).
+        """
+        from datetime import date, timedelta
+        today_date = date.today()
+        yesterday = today_date - timedelta(days=1)
+
+        # Try today first
+        history = db.query(PlatformHistoryModel).filter(
+            PlatformHistoryModel.stop_id == queried_stop_numeric,
+            PlatformHistoryModel.route_short_name == route_short,
+            PlatformHistoryModel.headsign == headsign,
+            PlatformHistoryModel.observation_date == today_date,
+        ).order_by(PlatformHistoryModel.count.desc()).first()
+
+        if history:
+            return history.platform
+
+        # Fall back to yesterday
+        history = db.query(PlatformHistoryModel).filter(
+            PlatformHistoryModel.stop_id == queried_stop_numeric,
+            PlatformHistoryModel.route_short_name == route_short,
+            PlatformHistoryModel.headsign == headsign,
+            PlatformHistoryModel.observation_date == yesterday,
+        ).order_by(PlatformHistoryModel.count.desc()).first()
+
+        return history.platform if history else None
+
     departures = []
     for stop_time, trip, route in results:
         minutes_until = (stop_time.departure_seconds - current_seconds) // 60
+
+        # Get delay: prefer stop-specific delay, fall back to trip delay
+        delay_seconds = stop_delays.get(trip.id) or trip_delays.get(trip.id)
+        realtime_departure_time = None
+        realtime_minutes_until = None
+        is_delayed = False
+
+        if delay_seconds is not None and delay_seconds != 0:
+            is_delayed = delay_seconds > 60  # More than 1 minute delay
+            realtime_departure_seconds = stop_time.departure_seconds + delay_seconds
+            # Convert to HH:MM:SS format
+            rt_hours = realtime_departure_seconds // 3600
+            rt_minutes = (realtime_departure_seconds % 3600) // 60
+            rt_seconds = realtime_departure_seconds % 60
+            realtime_departure_time = f"{rt_hours:02d}:{rt_minutes:02d}:{rt_seconds:02d}"
+            realtime_minutes_until = max(0, (realtime_departure_seconds - current_seconds) // 60)
+
+        # Get train position (from GTFS-RT or estimated)
+        train_position = train_positions.get(trip.id)
+
+        # Get platform from GTFS-RT (prefer stop_time_update, then vehicle_position)
+        platform = stop_platforms.get(trip.id) or vehicle_platforms.get(trip.id)
+        platform_estimated = False
+
+        # If no real platform, try to get estimated from history
+        if not platform:
+            route_short = route.short_name.strip() if route.short_name else ""
+            estimated = get_estimated_platform(route_short, trip.headsign or "")
+            if estimated:
+                platform = estimated
+                platform_estimated = True
+
         departures.append(
             DepartureResponse(
                 trip_id=trip.id,
@@ -549,8 +735,18 @@ def get_stop_departures(
                 departure_seconds=stop_time.departure_seconds,
                 minutes_until=minutes_until,
                 stop_sequence=stop_time.stop_sequence,
+                platform=platform,
+                platform_estimated=platform_estimated,
+                delay_seconds=delay_seconds,
+                realtime_departure_time=realtime_departure_time,
+                realtime_minutes_until=realtime_minutes_until,
+                is_delayed=is_delayed,
+                train_position=train_position,
             )
         )
+
+    # Sort by realtime departure (use realtime_minutes_until if available, else minutes_until)
+    departures.sort(key=lambda d: d.realtime_minutes_until if d.realtime_minutes_until is not None else d.minutes_until)
 
     return departures
 

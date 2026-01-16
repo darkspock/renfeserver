@@ -60,6 +60,7 @@ class StopTimeUpdateModel(Base):
     arrival_time = Column(DateTime, nullable=True)  # Predicted arrival
     departure_delay = Column(Integer, nullable=True)  # Delay in seconds
     departure_time = Column(DateTime, nullable=True)  # Predicted departure
+    platform = Column(String(20), nullable=True)  # Platform/track number from GTFS-RT
 
     # Relationship to parent trip update
     trip_update = relationship("TripUpdateModel", back_populates="stop_time_updates")

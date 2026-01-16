@@ -1,3 +1,4 @@
+import re
 from dataclasses import dataclass
 from datetime import datetime
 from enum import Enum
@@ -25,6 +26,18 @@ class VehiclePosition:
     stop_id: str
     timestamp: datetime
     label: Optional[str] = None
+    platform: Optional[str] = None  # Platform/track number extracted from label
+
+    @staticmethod
+    def _extract_platform(label: Optional[str]) -> Optional[str]:
+        """Extract platform number from label like 'C4-23603-PLATF.(8)'."""
+        if not label:
+            return None
+        # Match patterns like "PLATF.(8)" or "PLATF.(12)"
+        match = re.search(r'PLATF\.\((\d+)\)', label)
+        if match:
+            return match.group(1)
+        return None
 
     @classmethod
     def from_gtfsrt_json(cls, entity: dict) -> "VehiclePosition":
@@ -40,6 +53,9 @@ class VehiclePosition:
         except ValueError:
             status = VehicleStatus.IN_TRANSIT_TO
 
+        label = vehicle_info.get("label")
+        platform = cls._extract_platform(label)
+
         return cls(
             vehicle_id=vehicle_info.get("id", ""),
             trip_id=trip.get("tripId", ""),
@@ -48,5 +64,6 @@ class VehiclePosition:
             current_status=status,
             stop_id=vehicle.get("stopId", ""),
             timestamp=datetime.fromtimestamp(int(vehicle.get("timestamp", 0))),
-            label=vehicle_info.get("label"),
+            label=label,
+            platform=platform,
         )

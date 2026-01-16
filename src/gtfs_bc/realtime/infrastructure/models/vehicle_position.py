@@ -25,6 +25,7 @@ class VehiclePositionModel(Base):
     current_status = Column(SQLEnum(VehicleStatusEnum), nullable=False)
     stop_id = Column(String(50), nullable=True, index=True)
     label = Column(String(100), nullable=True)
+    platform = Column(String(20), nullable=True)  # Platform/track number from GTFS-RT
     timestamp = Column(DateTime, nullable=False)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
