@@ -142,9 +142,9 @@ class GTFSRealtimeFetcher:
             if not route_short_name:
                 return
 
-            # Get headsign from trip
+            # Get headsign from trip (ensure never None)
             trip = self.db.query(TripModel).filter(TripModel.id == vp.trip_id).first()
-            headsign = trip.headsign if trip else "Unknown"
+            headsign = (trip.headsign if trip and trip.headsign else None) or "Unknown"
 
             # Normalize stop_id
             stop_id = vp.stop_id
