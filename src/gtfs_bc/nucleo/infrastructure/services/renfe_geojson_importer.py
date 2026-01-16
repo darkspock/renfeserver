@@ -87,6 +87,12 @@ class RenfeGeoJSONImporter:
             stats['sequences_created'] = sequences_created
             logger.info(f"Stop sequences: {sequences_created} created")
 
+            # Update route long_name with terminus information
+            logger.info("Updating route terminus names...")
+            routes_terminus_updated = self._update_route_long_names()
+            stats['routes_terminus_updated'] = routes_terminus_updated
+            logger.info(f"Route terminus names: {routes_terminus_updated} updated")
+
             self.db.commit()
             logger.info("Successfully imported all Renfe data")
 
@@ -609,3 +615,31 @@ class RenfeGeoJSONImporter:
                 sequences_created += 1
 
         return sequences_created
+
+    def _update_route_long_names(self) -> int:
+        """Update route long_name with terminus information (first stop - last stop).
+
+        Returns:
+            Number of routes updated
+        """
+        update_query = text("""
+            WITH route_termini AS (
+                SELECT
+                    srs.route_id,
+                    FIRST_VALUE(s.name) OVER (PARTITION BY srs.route_id ORDER BY srs.sequence ASC) as first_stop,
+                    FIRST_VALUE(s.name) OVER (PARTITION BY srs.route_id ORDER BY srs.sequence DESC) as last_stop
+                FROM gtfs_stop_route_sequence srs
+                JOIN gtfs_stops s ON s.id = srs.stop_id
+            ),
+            distinct_termini AS (
+                SELECT DISTINCT route_id, first_stop, last_stop
+                FROM route_termini
+            )
+            UPDATE gtfs_routes r
+            SET long_name = dt.first_stop || ' - ' || dt.last_stop
+            FROM distinct_termini dt
+            WHERE r.id = dt.route_id
+        """)
+
+        result = self.db.execute(update_query)
+        return result.rowcount
