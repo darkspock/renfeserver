@@ -577,10 +577,12 @@ class RenfeGeoJSONImporter:
                     )
 
                     if gtfs_stop:
-                        # Deduplicate: keep only first occurrence for each stop/route pair
-                        key = (gtfs_stop.id, gtfs_route.id)
-                        if key not in sequences_to_add:
-                            sequences_to_add[key] = closest_index
+                        # Only assign stops from the same nucleo as the route
+                        if gtfs_stop.nucleo_id == gtfs_route.nucleo_id:
+                            # Deduplicate: keep only first occurrence for each stop/route pair
+                            key = (gtfs_stop.id, gtfs_route.id)
+                            if key not in sequences_to_add:
+                                sequences_to_add[key] = closest_index
 
         # Add all sequences, checking for existing ones in database
         for (stop_id, route_id), sequence in sequences_to_add.items():
